@@ -37,15 +37,30 @@ if (!apiId || !apiHash) {
 // ═══════════════════════════════════════
 // FIREBASE CONNECTION
 // ═══════════════════════════════════════
-const serviceAccountPath = path.resolve(__dirname, '../serviceAccountKey.json');
-if (!fs.existsSync(serviceAccountPath)) {
-  console.error(`❌ ERROR: File service account firebase tidak ditemukan di ${serviceAccountPath}!`);
-  process.exit(1);
+let firebaseCredential;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    firebaseCredential = admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+    console.log("✅ Firebase terhubung menggunakan env FIREBASE_SERVICE_ACCOUNT");
+  } catch (err) {
+    console.error("❌ ERROR: Gagal mem-parse FIREBASE_SERVICE_ACCOUNT dari env:", err.message);
+    process.exit(1);
+  }
+} else {
+  const serviceAccountPath = path.resolve(__dirname, '../serviceAccountKey.json');
+  if (fs.existsSync(serviceAccountPath)) {
+    firebaseCredential = admin.credential.cert(serviceAccountPath);
+    console.log("✅ Firebase terhubung menggunakan file serviceAccountKey.json");
+  } else {
+    console.error(`❌ ERROR: File firebase service account tidak ditemukan di ${serviceAccountPath} dan env FIREBASE_SERVICE_ACCOUNT juga kosong!`);
+    process.exit(1);
+  }
 }
 
 if (!admin.apps.length) {
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccountPath),
+    credential: firebaseCredential,
   });
 }
 const db = admin.firestore();
