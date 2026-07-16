@@ -269,11 +269,8 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
     let chatEntity = null;
     try {
       chatEntity = await message.getChat();
-      if (!chatEntity) {
-        chatEntity = await message.getSender();
-      }
     } catch (e) {
-      console.log(`🔍 DEBUG: Gagal getChat/getSender: ${e.message}`);
+      console.log(`🔍 DEBUG: Gagal getChat(): ${e.message}`);
     }
 
     if (!chatEntity && message.peerId) {
