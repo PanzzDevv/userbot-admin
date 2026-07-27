@@ -149,17 +149,22 @@ function getWIBTime() {
   }) + ' WIB';
 }
 
-async function createPakasirQRIS(orderId, amount) {
+async function createPanzzPayQRIS(orderId, amount) {
   try {
-    const response = await axios.post(`https://app.pakasir.com/api/transactioncreate/qris`, {
-      project: process.env.PAKASIR_PROJECT_NAME,
-      order_id: orderId,
+    const response = await axios.post('https://panzzpay.my.id/api/payment', {
       amount: amount,
-      api_key: process.env.PAKASIR_API_KEY
+      customer_order_id: orderId,
+      webhook_url: process.env.WEBHOOK_BASE_URL || '',
+      bot_name: process.env.STORE_NAME || 'PanzzStore',
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.PANZZPAY_API_KEY,
+      }
     });
     return response.data;
   } catch (error) {
-    console.error('Pakasir API Error:', error.response?.data || error.message);
+    console.error('PanzzPay API Error:', error.response?.data || error.message);
     return null;
   }
 }
@@ -330,13 +335,15 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
         let qrBuffer = null;
         let isDynamic = false;
 
-        // Coba bikin QRIS Pakasir jika API Key dikonfigurasi
-        if (process.env.PAKASIR_API_KEY && process.env.PAKASIR_PROJECT_NAME) {
-          const res = await createPakasirQRIS(orderId, nominal);
-          const qrString = res?.payment?.payment_number;
-          if (qrString) {
-            qrBuffer = await QRCode.toBuffer(qrString);
-            qrBuffer.name = "qris.png"; // Set filename for photo detection!
+        // Coba bikin QRIS PanzzPay jika API Key dikonfigurasi
+        if (process.env.PANZZPAY_API_KEY) {
+          const res = await createPanzzPayQRIS(orderId, nominal);
+          const qrDataUrl = res?.qr_data_url || res?.qr_png_data_url;
+          if (qrDataUrl) {
+            // Convert base64 data URL to buffer
+            const base64Data = qrDataUrl.replace(/^data:image\/\w+;base64,/, '');
+            qrBuffer = Buffer.from(base64Data, 'base64');
+            qrBuffer.name = "qris.png";
             isDynamic = true;
           }
         }
@@ -346,13 +353,13 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           const staticPath = path.resolve(__dirname, process.env.QRIS_IMAGE_PATH || '../whatsapp-bot/assets/qris-dana.jpg');
           if (fs.existsSync(staticPath)) {
             qrBuffer = fs.readFileSync(staticPath);
-            qrBuffer.name = "qris.jpg"; // Set filename for photo detection!
+            qrBuffer.name = "qris.jpg";
           }
         }
 
         if (!qrBuffer) {
           await client.sendMessage(targetPeer, {
-            message: "❌ Gagal membuat invoice. File QRIS statis maupun integrasi Pakasir tidak tersedia."
+            message: "❌ Gagal membuat invoice. File QRIS statis maupun integrasi PanzzPay tidak tersedia."
           });
           return;
         }
