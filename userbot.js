@@ -156,6 +156,7 @@ async function createPanzzPayQRIS(orderId, amount) {
       customer_order_id: orderId,
       webhook_url: process.env.WEBHOOK_BASE_URL || '',
       bot_name: process.env.STORE_NAME || 'PanzzStore',
+      use_unique_code: process.env.PANZZPAY_USE_UNIQUE_CODE === 'true',
     }, {
       headers: {
         'Content-Type': 'application/json',
@@ -335,11 +336,13 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
         let qrBuffer = null;
         let isDynamic = false;
 
+        let finalNominal = nominal;
         // Coba bikin QRIS PanzzPay jika API Key dikonfigurasi
         if (process.env.PANZZPAY_API_KEY) {
           const res = await createPanzzPayQRIS(orderId, nominal);
           const qrDataUrl = res?.qr_data_url || res?.qr_png_data_url;
           if (qrDataUrl) {
+            finalNominal = res?.unique_amount || res?.total || nominal;
             // Convert base64 data URL to buffer
             const base64Data = qrDataUrl.replace(/^data:image\/\w+;base64,/, '');
             qrBuffer = Buffer.from(base64Data, 'base64');
@@ -367,7 +370,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
         // Simpan ke memory
         activeInvoices.set(chatId, {
           orderId,
-          nominal,
+          nominal: finalNominal,
           deskripsi,
           createdAt: new Date().toISOString()
         });
@@ -379,7 +382,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           `📅 <b>Tanggal</b> : <code>${getWIBTime()}</code>\n` +
           `🆔 <b>Order ID</b> : <code>${orderId}</code>\n` +
           `🛍️ <b>Detail Item</b> : <i>${escapeHTML(deskripsi)}</i>\n` +
-          `💰 <b>Total Pembayaran</b> : <b>${escapeHTML(formatIDR(nominal))}</b>\n` +
+          `💰 <b>Total Pembayaran</b> : <b>${escapeHTML(formatIDR(finalNominal))}</b>\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
           `📸 <b>Panduan Pembayaran:</b>\n` +
           `1️⃣ Pindai/Scan QRIS ${isDynamic ? 'Dinamis' : 'Statis'} di bawah ini.\n` +
