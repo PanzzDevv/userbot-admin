@@ -28,6 +28,11 @@ const apiHash = process.env.TELEGRAM_API_HASH;
 const sessionString = process.env.TELEGRAM_SESSION || "";
 const adminId = process.env.ADMIN_TELEGRAM_ID || "";
 const storeName = process.env.STORE_NAME || "PanzzStore";
+const panzzPayBaseUrl = (process.env.PANZZPAY_BASE_URL || 'https://panzzpay.my.id').replace(/\/+$/, '');
+const panzzPayPollIntervalMs = Math.max(
+  3000,
+  Math.min(parseInt(process.env.PANZZPAY_POLL_INTERVAL_MS || '5000', 10) || 5000, 30000)
+);
 
 if (!apiId || !apiHash) {
   console.error("❌ ERROR: TELEGRAM_API_ID dan TELEGRAM_API_HASH harus diisi di file .env!");
@@ -151,7 +156,7 @@ function getWIBTime() {
 
 async function createPanzzPayQRIS(orderId, amount) {
   try {
-    const response = await axios.post('https://panzzpay.my.id/api/payment', {
+    const response = await axios.post(`${panzzPayBaseUrl}/api/payment`, {
       amount: amount,
       customer_order_id: orderId,
       webhook_url: process.env.WEBHOOK_BASE_URL || '',
@@ -161,12 +166,242 @@ async function createPanzzPayQRIS(orderId, amount) {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': process.env.PANZZPAY_API_KEY,
-      }
+      },
+      timeout: 20000,
     });
     return response.data;
   } catch (error) {
     console.error('PanzzPay API Error:', error.response?.data || error.message);
     return null;
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getPanzzPayPaymentStatus(invoice) {
+  const statusUrl = invoice.statusUrl ||
+    `${panzzPayBaseUrl}/api/payment?transaction_id=${encodeURIComponent(invoice.paymentId)}`;
+
+  const response = await axios.get(statusUrl, {
+    headers: {
+      'x-api-key': process.env.PANZZPAY_API_KEY,
+    },
+    timeout: 25000,
+  });
+
+  return response.data;
+}
+
+async function cancelPanzzPayPayment(invoice) {
+  if (!invoice?.paymentId) return;
+
+  await axios.post(`${panzzPayBaseUrl}/api/payment/cancel`, {
+    transaction_id: invoice.paymentId,
+    id: invoice.paymentId,
+    customer_order_id: invoice.orderId,
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.PANZZPAY_API_KEY,
+    },
+    timeout: 20000,
+  });
+}
+
+async function persistPendingInvoice(chatId, invoice) {
+  if (!invoice.paymentId) return;
+
+  await db.collection('orders').doc(invoice.orderId).set({
+    id: invoice.orderId,
+    telegramUserId: chatId,
+    customerName: invoice.customerName,
+    telegramUsername: invoice.telegramUsername,
+    productName: invoice.deskripsi,
+    totalPrice: invoice.nominal,
+    paymentMethod: 'panzzpay_qris',
+    gatewayPaymentId: invoice.paymentId,
+    gatewayStatusUrl: invoice.statusUrl,
+    status: 'pending',
+    createdAt: invoice.createdAt,
+    expiresAt: invoice.expiresAt
+      ? new Date(invoice.expiresAt).toISOString()
+      : null,
+  }, { merge: true });
+}
+
+async function finalizePaidInvoice(chatId, targetPeer, invoice, paidAt = null) {
+  if (!invoice || invoice.finalizing) return false;
+  invoice.finalizing = true;
+
+  try {
+    const paidAtIso = paidAt
+      ? new Date(paidAt).toISOString()
+      : new Date().toISOString();
+
+    await db.collection('orders').doc(invoice.orderId).set({
+      id: invoice.orderId,
+      telegramUserId: chatId,
+      customerName: invoice.customerName,
+      telegramUsername: invoice.telegramUsername,
+      productName: invoice.deskripsi,
+      totalPrice: invoice.nominal,
+      paymentMethod: invoice.paymentId ? 'panzzpay_qris' : 'qris_manual',
+      gatewayPaymentId: invoice.paymentId || null,
+      status: 'paid',
+      createdAt: invoice.createdAt,
+      paidAt: paidAtIso,
+    }, { merge: true });
+
+    await client.sendMessage(targetPeer, {
+      message: `<blockquote><b>✅ PEMBAYARAN LUNAS / BERHASIL</b>\n` +
+               `━━━━━━━━━━━━━━━━━━━━\n` +
+               `🆔 <b>Order ID</b> : <code>${invoice.orderId}</code>\n` +
+               `🛍️ <b>Detail Item</b> : <i>${escapeHTML(invoice.deskripsi)}</i>\n` +
+               `💰 <b>Jumlah Bayar</b> : <b>${escapeHTML(formatIDR(invoice.nominal))}</b>\n` +
+               `⏱️ <b>Status Transaksi</b> : <b>LUNAS / PAID</b>\n` +
+               `━━━━━━━━━━━━━━━━━━━━\n` +
+               `🚀 <i>Pembayaran terverifikasi otomatis. Pesanan siap diproses.</i></blockquote>`,
+      parseMode: 'html'
+    });
+
+    if (activeInvoices.get(chatId) === invoice) {
+      activeInvoices.delete(chatId);
+    }
+
+    console.log(`[PanzzPay Poller] Payment ${invoice.paymentId || invoice.orderId} berhasil diproses.`);
+    return true;
+  } catch (error) {
+    invoice.finalizing = false;
+    throw error;
+  }
+}
+
+async function expireInvoice(chatId, targetPeer, invoice, status) {
+  if (!invoice || invoice.finalizing) return;
+  invoice.finalizing = true;
+
+  try {
+    await db.collection('orders').doc(invoice.orderId).set({
+      status: status === 'cancelled' ? 'cancelled' : 'expired',
+      expiredAt: new Date().toISOString(),
+    }, { merge: true });
+
+    await client.sendMessage(targetPeer, {
+      message: `<blockquote><b>⌛ TAGIHAN KEDALUWARSA</b>\n` +
+               `━━━━━━━━━━━━━━━━━━━━\n` +
+               `🆔 <b>Order ID</b> : <code>${invoice.orderId}</code>\n` +
+               `⚠️ <i>Pembayaran tidak diterima sampai batas waktu tagihan.</i></blockquote>`,
+      parseMode: 'html'
+    });
+
+    if (activeInvoices.get(chatId) === invoice) {
+      activeInvoices.delete(chatId);
+    }
+  } catch (error) {
+    invoice.finalizing = false;
+    throw error;
+  }
+}
+
+function startPanzzPayPolling(chatId, targetPeer, invoice) {
+  if (!invoice?.paymentId || invoice.polling) return;
+  invoice.polling = true;
+
+  (async () => {
+    let consecutiveErrors = 0;
+    console.log(`[PanzzPay Poller] Memantau ${invoice.paymentId} setiap ${panzzPayPollIntervalMs / 1000} detik.`);
+
+    while (activeInvoices.get(chatId) === invoice && !invoice.finalizing) {
+      await sleep(panzzPayPollIntervalMs);
+
+      if (activeInvoices.get(chatId) !== invoice || invoice.finalizing) break;
+
+      try {
+        const expiresAtMs = invoice.expiresAt
+          ? new Date(invoice.expiresAt).getTime()
+          : 0;
+        if (expiresAtMs && Date.now() > expiresAtMs + 60000) {
+          await expireInvoice(chatId, targetPeer, invoice, 'expired');
+          break;
+        }
+
+        const payment = await getPanzzPayPaymentStatus(invoice);
+        const status = String(payment?.status || '').toLowerCase();
+        consecutiveErrors = 0;
+
+        if (status === 'paid' || status === 'success') {
+          await finalizePaidInvoice(chatId, targetPeer, invoice, payment.paid_at);
+          break;
+        }
+
+        if (['expired', 'timeout', 'cancelled', 'canceled'].includes(status)) {
+          await expireInvoice(chatId, targetPeer, invoice, status);
+          break;
+        }
+      } catch (error) {
+        consecutiveErrors++;
+        if (consecutiveErrors === 1 || consecutiveErrors % 6 === 0) {
+          console.warn(
+            `[PanzzPay Poller] Gagal cek ${invoice.paymentId} (${consecutiveErrors}x):`,
+            error.response?.data || error.message
+          );
+        }
+      }
+    }
+  })().catch(error => {
+    invoice.polling = false;
+    console.error(`[PanzzPay Poller] Error fatal ${invoice.paymentId}:`, error.message);
+  });
+}
+
+async function restorePendingPanzzPayInvoices() {
+  try {
+    const snapshot = await db.collection('orders').where('status', '==', 'pending').get();
+    const pendingOrders = snapshot.docs
+      .map(doc => doc.data())
+      .filter(order =>
+        order.paymentMethod === 'panzzpay_qris' &&
+        order.gatewayPaymentId &&
+        order.telegramUserId
+      )
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    let restored = 0;
+    for (const order of pendingOrders) {
+      const chatId = String(order.telegramUserId);
+      if (activeInvoices.has(chatId)) continue;
+
+      const invoice = {
+        orderId: order.id,
+        nominal: order.totalPrice,
+        deskripsi: order.productName,
+        createdAt: order.createdAt,
+        customerName: order.customerName || 'User Telegram',
+        telegramUsername: order.telegramUsername || '',
+        paymentId: order.gatewayPaymentId,
+        statusUrl: order.gatewayStatusUrl || null,
+        expiresAt: order.expiresAt || null,
+        polling: false,
+        finalizing: false,
+      };
+
+      try {
+        const targetPeer = await client.getEntity(chatId);
+        activeInvoices.set(chatId, invoice);
+        startPanzzPayPolling(chatId, targetPeer, invoice);
+        restored++;
+      } catch (error) {
+        console.warn(`[PanzzPay Poller] Gagal memulihkan invoice ${invoice.orderId}:`, error.message);
+      }
+    }
+
+    if (restored > 0) {
+      console.log(`[PanzzPay Poller] ${restored} invoice pending dipulihkan setelah restart.`);
+    }
+  } catch (error) {
+    console.warn('[PanzzPay Poller] Gagal membaca invoice pending dari Firestore:', error.message);
   }
 }
 
@@ -263,6 +498,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
   // Deteksi username customer bot dari API Telegram secara dinamis
   await fetchCustomerBotUsername();
+  await restorePendingPanzzPayInvoices();
   
   if (!sessionString) {
     console.log("\n=======================================================");
@@ -321,6 +557,13 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
       // Perintah: .pay <nominal> <deskripsi>
       if (command === '.pay') {
+        if (activeInvoices.has(chatId)) {
+          await client.sendMessage(targetPeer, {
+            message: "⚠️ Masih ada invoice aktif di chat ini. Selesaikan atau batalkan dengan `.cancel` sebelum membuat invoice baru."
+          });
+          return;
+        }
+
         if (args.length < 2) {
           await client.sendMessage(targetPeer, {
             message: "⚠️ *Format Perintah Salah!*\n\nGunakan: `.pay <nominal> <deskripsi>`\nContoh: `.pay 15000 Netflix Premium`",
@@ -346,6 +589,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
         let qrBuffer = null;
         let isDynamic = false;
+        let gatewayPayment = null;
 
         let finalNominal = nominal;
         // Coba bikin QRIS PanzzPay jika API Key dikonfigurasi
@@ -359,6 +603,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
             qrBuffer = Buffer.from(base64Data, 'base64');
             qrBuffer.name = "qris.png";
             isDynamic = true;
+            gatewayPayment = res;
           }
         }
 
@@ -379,12 +624,20 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
         }
 
         // Simpan ke memory
-        activeInvoices.set(chatId, {
+        const activeInvoice = {
           orderId,
           nominal: finalNominal,
           deskripsi,
-          createdAt: new Date().toISOString()
-        });
+          createdAt: new Date().toISOString(),
+          customerName: chatEntity ? (chatEntity.firstName || chatEntity.title || 'User Telegram') : 'User Telegram',
+          telegramUsername: chatEntity ? (chatEntity.username || '') : '',
+          paymentId: gatewayPayment?.id || gatewayPayment?.transaction_id || null,
+          statusUrl: gatewayPayment?.status_url || null,
+          expiresAt: gatewayPayment?.expires_at || null,
+          polling: false,
+          finalizing: false,
+        };
+        activeInvoices.set(chatId, activeInvoice);
 
         // Buat invoice text
         const invoiceMsg = 
@@ -409,6 +662,15 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           parseMode: 'html',
           forceDocument: false
         });
+
+        if (activeInvoice.paymentId) {
+          try {
+            await persistPendingInvoice(chatId, activeInvoice);
+          } catch (error) {
+            console.warn(`[PanzzPay Poller] Gagal menyimpan invoice pending ${orderId}:`, error.message);
+          }
+          startPanzzPayPolling(chatId, targetPeer, activeInvoice);
+        }
         return;
       }
 
@@ -420,37 +682,8 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           return;
         }
 
-        const { orderId, nominal, deskripsi, createdAt } = activeInvoice;
-
         try {
-          // Buat data order di Firestore
-          await db.collection('orders').doc(orderId).set({
-            id: orderId,
-            telegramUserId: chatId,
-            customerName: chatEntity ? (chatEntity.firstName || chatEntity.title || 'User Telegram') : 'User Telegram',
-            telegramUsername: chatEntity ? (chatEntity.username || '') : '',
-            productName: deskripsi,
-            totalPrice: nominal,
-            paymentMethod: 'qris_manual',
-            status: 'paid',
-            createdAt: createdAt,
-            paidAt: new Date().toISOString(),
-          });
-
-          // Hapus dari memory
-          activeInvoices.delete(chatId);
-
-          await client.sendMessage(targetPeer, {
-            message: `<blockquote><b>✅ PEMBAYARAN LUNAS / BERHASIL</b>\n` +
-                     `━━━━━━━━━━━━━━━━━━━━\n` +
-                     `🆔 <b>Order ID</b> : <code>${orderId}</code>\n` +
-                     `🛍️ <b>Detail Item</b> : <i>${escapeHTML(deskripsi)}</i>\n` +
-                     `💰 <b>Jumlah Bayar</b> : <b>${escapeHTML(formatIDR(nominal))}</b>\n` +
-                     `⏱️ <b>Status Transaksi</b> : <b>LUNAS / PAID</b>\n` +
-                     `━━━━━━━━━━━━━━━━━━━━\n` +
-                     `🚀 <i>Terima kasih atas pembayaran Anda! Pesanan Anda telah berhasil diproses oleh admin.</i></blockquote>`,
-            parseMode: 'html'
-          });
+          await finalizePaidInvoice(chatId, targetPeer, activeInvoice);
         } catch (err) {
           console.error("Gagal simpan order:", err);
           await client.sendMessage(targetPeer, { message: "❌ Terjadi error saat mengupdate status order ke database." });
@@ -466,7 +699,23 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           return;
         }
 
+        if (activeInvoice.paymentId) {
+          try {
+            await cancelPanzzPayPayment(activeInvoice);
+          } catch (error) {
+            console.warn(`[PanzzPay Poller] Gateway gagal membatalkan ${activeInvoice.paymentId}:`, error.response?.data || error.message);
+          }
+        }
+
         activeInvoices.delete(chatId);
+        if (activeInvoice.paymentId) {
+          db.collection('orders').doc(activeInvoice.orderId).set({
+            status: 'cancelled',
+            cancelledAt: new Date().toISOString(),
+          }, { merge: true }).catch(error => {
+            console.warn(`[PanzzPay Poller] Gagal menyimpan pembatalan ${activeInvoice.orderId}:`, error.message);
+          });
+        }
         await client.sendMessage(targetPeer, {
           message: `<blockquote><b>❌ TAGIHAN DIBATALKAN</b>\n` +
                    `━━━━━━━━━━━━━━━━━━━━\n` +
