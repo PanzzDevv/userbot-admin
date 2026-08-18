@@ -178,6 +178,25 @@ async function getStoreProductsContext() {
     }
     
     let contextStr = "Berikut adalah daftar produk, varian, harga, dan stok real-time di toko saat ini:\n";
+    // Predefined FAQ Rules & Answers (Menggunakan Regex Pattern agar tidak salah balas pada percakapan santai)
+    const faqRules = [
+      {
+        pattern: /\b(ready|stok|ada stok|stok ready)\b/i,
+        answer: `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Semua produk digital yang tertera di katalog kami selalu ready stock. Silakan buat pesanan melalui bot utama kami di @autoorderbot atau tunggu respon admin untuk order manual ya.</blockquote>`
+      },
+      {
+        pattern: /\b(harga|pricelist|spill harga|berapa harganya?)\b/i,
+        answer: `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Daftar harga produk lengkap dan stok terbaru dapat diakses langsung melalui bot utama kami dengan mengetik /start di @autoorderbot.</blockquote>`
+      },
+      {
+        pattern: /(\bcara bayar\b|\bmetode bayar\b|\bbayar (pake|pakai|lewat|via)\b|\bpembayaran\b|\bqris\b|\bbayar bagaimanakah?\b)/i,
+        answer: `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nKami menerima metode pembayaran otomatis QRIS (DANA, OVO, GoPay, ShopeePay, LinkAja). Admin juga bisa membuatkan tagihan QRIS manual langsung di chat ini jika Anda memesan manual.</blockquote>`
+      },
+      {
+        pattern: /\b(bantuan|help|admin)\b/i,
+        answer: `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Ada yang bisa dibantu? Silakan tulis detail kendala atau produk yang ingin dipesan secara lengkap. Admin akan membalas secepatnya.</blockquote>`
+      }
+    ];
     snapshot.forEach(doc => {
       const data = doc.data();
       if (data.isVisible === false) return;
@@ -211,14 +230,6 @@ async function getStoreProductsContext() {
   }
 }
 
-// Predefined FAQ Keywords & Answers
-const faqKeywords = {
-  "ready": `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Semua produk digital yang tertera di katalog kami selalu ready stock. Silakan buat pesanan melalui bot utama kami di @autoorderbot atau tunggu respon admin untuk order manual ya.</blockquote>`,
-  "harga": `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Daftar harga produk lengkap dan stok terbaru dapat diakses langsung melalui bot utama kami dengan mengetik /start di @autoorderbot.</blockquote>`,
-  "bayar": `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nKami menerima metode pembayaran otomatis QRIS (DANA, OVO, GoPay, ShopeePay, LinkAja). Admin juga bisa membuatkan tagihan QRIS manual langsung di chat ini jika Anda memesan manual.</blockquote>`,
-  "qris": `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nUntuk pembayaran QRIS manual, mohon tunggu admin mengirimkan invoice tagihan beserta QR code resmi. Jangan transfer ke QRIS lain selain yang dikirimkan oleh admin.</blockquote>`,
-  "bantuan": `<blockquote><b>🤖 ${storeName.toUpperCase()} FAQ</b>\n━━━━━━━━━━━━━━━━━━━━\nHalo kak! Ada yang bisa dibantu? Silakan tulis detail kendala atau produk yang ingin dipesan secara lengkap. Admin akan membalas secepatnya.</blockquote>`
-};
 
 // ═══════════════════════════════════════
 // TELEGRAM CLIENT RUNTIME
@@ -560,7 +571,19 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
     // ───────────────────────────────────────
     // 3. AUTO-RESPONDER / FAQ / GEMINI AI
     // ───────────────────────────────────────
-    // Hanya merespons jika bukan dari admin dan di private chat (cooldown dinonaktifkan)
+    // A. Cek apakah pengirim adalah akun Bot Telegram (Jangan dibalas jika dari Bot lain)
+    let senderEntity = null;
+    try {
+      senderEntity = await message.getSender();
+    } catch (e) {}
+
+    const isBotUser = Boolean(chatEntity?.bot || senderEntity?.bot);
+    if (isBotUser) {
+      console.log(`🤖 DEBUG: Mengabaikan pesan dari akun Bot Telegram (@${chatEntity?.username || senderEntity?.username || 'bot'})`);
+      return;
+    }
+
+    // Hanya merespons jika bukan dari admin dan di private chat
     const isPrivateChat = message.peerId && message.peerId.className === 'PeerUser';
     if (!isFromAdmin && senderId && isPrivateChat) {
       const now = Date.now();
@@ -570,7 +593,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
       if (now - lastReply > cooldownMs) {
         const lowercaseMsg = text.toLowerCase();
 
-        // Filter lokal untuk mengabaikan pesan yang hanya berupa tawa, emoji, atau teks singkat basa-basi
+        // Filter 1: Abaikan tawa, emoji-only, atau ucapan singkat/basa-basi
         const isLaughter = /^(wk|ha|he|xi|wkwk|haha|hehe|xixi|wkwkwk|wkwkkw|wkwkk|hahaha|ha+ha+|wk+wk+)+$/i.test(lowercaseMsg);
         const isEmojiOnly = /^[\p{Emoji}\s]+$/u.test(text) && !/[\w?]/.test(text);
         const isShortAck = /^(ok|oke|siap|sip|y|ya|g|ga|tidak|no|yes|p|ping|thx|thanks|makasih|suwun|wkwk|hehe|haha)$/i.test(lowercaseMsg);
@@ -580,17 +603,28 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
           return;
         }
 
+        // Filter 2: Pastikan pesan adalah PERTANYAAN atau INQUIRY TERKAIT TOKO
+        const hasQuestionMark = text.includes('?');
+        const isAskingQuestion = hasQuestionMark || 
+          /\b(apa|berapa|bagaimana|gimana|apakah|ready|ada|bisa|spill|cara|cek|stok|pricelist|pembayaran|min|kak|order|beli|pesan|seberapa|lokasi|alamat)\b/i.test(lowercaseMsg);
+
+        // Jika pesan hanya percakapan santai (contoh: "besok bayar ya bro", "lagi di mana") tanpa tanda tanya/pertanyaan toko, SKIP!
+        if (!isAskingQuestion) {
+          console.log(`🔍 DEBUG: Pesan di-SKIP karena bukan berupa pertanyaan/inquiry toko: "${text}"`);
+          return;
+        }
+
         let answer = null;
 
-        // A. Cek Keyword FAQ sederhana dahulu
-        for (const [kw, resp] of Object.entries(faqKeywords)) {
-          if (lowercaseMsg.includes(kw)) {
-            answer = resp.replace(/@autoorderbot/g, customerBotUsername);
+        // A. Cek FAQ Rules (Regex Pattern spesifik)
+        for (const rule of faqRules) {
+          if (rule.pattern.test(lowercaseMsg)) {
+            answer = rule.answer.replace(/@autoorderbot/g, customerBotUsername);
             break;
           }
         }
 
-        // B. Jika tidak ada keyword yang cocok, dan Gemini AI aktif, gunakan Gemini
+        // B. Jika tidak ada FAQ rule yang cocok, dan Gemini AI aktif, gunakan Gemini
         if (!answer && geminiModel) {
           try {
              const productsContext = await getStoreProductsContext();
@@ -603,7 +637,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
               `2. Jika produk/varian yang ditanyakan tidak ada di list atau stok kosong (0), katakan dengan sopan bahwa produk tersebut sedang kosong/tidak tersedia.\n` +
               `3. Jika ada komplain, keluhan transaksi, atau masalah teknis rumit, katakan bahwa admin akan segera membalas chat ini secara manual.\n` +
               `4. Jawablah dengan bahasa Indonesia yang santai, bersahabat, namun tetap sopan. Jangan menggunakan format markdown yang rumit.\n` +
-              `5. Jika pesan pelanggan hanya berupa obrolan santai, basa-basi (chitchat), ekspresi tawa, keluhan singkat tanpa pertanyaan (seperti "susah", "gagal"), candaan, atau bukan pertanyaan/pernyataan terkait info produk/pembelian/bantuan toko, kamu WAJIB menjawab hanya dengan satu kata saja: SKIP. Jangan berikan jawaban lainnya.`;
+              `5. Jika pesan pelanggan hanya berupa obrolan santai, perbincangan biasa antar teman, keluhan tanpa pertanyaan, candaan, atau bukan pertanyaan/inquiry terkait info produk/pembelian/toko, kamu WAJIB menjawab hanya dengan satu kata saja: SKIP. Jangan berikan jawaban lainnya.`;
 
             const prompt = `${systemPrompt}\n\nPesan Pelanggan: "${text}"\nJawaban Asisten:`;
             const result = await geminiModel.generateContent(prompt);
